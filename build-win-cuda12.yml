@@ -1,0 +1,96 @@
+# 只编译 Windows + CUDA12 的精简 workflow（给 fork 仓库用）
+#
+# 放到 fork 仓库的 .github/workflows/build-win-cuda12.yml，
+# 然后在 Actions → "Win-CUDA12 only" → Run workflow。
+#
+# 🔴 顺序：必须先提交到 fork 的 **master（默认分支）** 才会出现在 Actions 左侧列表
+#    （workflow_dispatch 只在默认分支上认）。之后再从 master 开开发分支，
+#    这样开发分支也自带这个 workflow。
+#
+# ── 为什么单独新建这个文件，而不是改上游的 build.yml ──
+# 1. 上游 build.yml 一次跑 7 个 job
+#    （ubuntu×2 / vulkan / rocm / docker / macOS / windows×2），
+#    而我们只要 windows + cuda12 → 跑全量要多等一个多小时
+# 2. 改上游文件 = 将来 `git merge upstream` 必冲突；
+#    新建独立文件 = 零冲突，build.yml 保持上游原样
+# 3. 上游的 Pack / Upload 步骤都带
+#       if: (push master) || inputs.create_release == 'true'
+#    不勾 create_release 就一个产物都拿不到。
+#    这里去掉该条件 → 不建 Release 也照样上传 artifact
+#
+# 来源：照抄上游 build.yml 的 windows-latest-cmake 中 cuda12 那一档，
+#      仅删掉 Vulkan / Node / pnpm（前端与 docker 才用得到）。
+# 依据：docs/design-motion-transfer.md §32.5
+
+name: Win-CUDA12 only
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-cuda12:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install cuda-toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "12.8.1"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Activate MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_CXX_FLAGS='/bigobj' -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_BUILD_TYPE=Release -DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES='86;89;100;120' -DCMAKE_CUDA_FLAGS='-Xcudafe "--diag_suppress=177" -Xcudafe "--diag_suppress=550"'
+          cmake --build .
+
+      - name: Pack artifacts
+        run: |
+          # 🔴 两个路径都要判：Ninja 是单配置 generator，产物直接落在 build\bin，
+          #    没有 Release 子目录（多配置 generator 如 VS 才有）。
+          #    2026-10-23 第一次跑就是只判 Release 直接 throw，白跑一小时。
+          $filePath = ".\build\bin\Release\*"
+          if (Test-Path $filePath) {
+            echo "Exists at path $filePath"
+            Copy-Item ggml/LICENSE .\build\bin\Release\ggml.txt
+            Copy-Item LICENSE .\build\bin\Release\stable-diffusion.cpp.txt
+          } elseif (Test-Path ".\build\bin\stable-diffusion.dll") {
+            $filePath = ".\build\bin\*"
+            echo "Exists at path $filePath"
+            Copy-Item ggml/LICENSE .\build\bin\ggml.txt
+            Copy-Item LICENSE .\build\bin\stable-diffusion.cpp.txt
+          } else {
+            ls .\build\bin
+            throw "Can't find stable-diffusion.dll"
+          }
+          7z a sd-win-cuda12-x64.zip $filePath
+          # 产物兜底自检：打完就验，别等到本地才发现包是空的
+          if (-not (Test-Path sd-win-cuda12-x64.zip)) { throw "zip not produced" }
+          7z l sd-win-cuda12-x64.zip | Select-String "stable-diffusion.dll|sd-server.exe|ggml-cuda.dll"
+
+      - name: Pack Cuda runtime
+        run: |
+          $dst = '.\build\bin\cudart\'
+          robocopy "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          # robocopy 退出码 0-7 都算成功（1 = 有文件被复制），>=8 才是失败
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
+          7z a sd-cudart-win-cu12-x64.zip $dst\*
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-win-cuda12-x64
+          path: |
+            sd-win-cuda12-x64.zip
+            sd-cudart-win-cu12-x64.zip
