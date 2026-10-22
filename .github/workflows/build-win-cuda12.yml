@@ -20,7 +20,7 @@
 #
 # 来源：照抄上游 build.yml 的 windows-latest-cmake 中 cuda12 那一档，
 #      仅删掉 Vulkan / Node / pnpm（前端与 docker 才用得到）。
-# 依据：docs/design-motion-transfer.md §32.5/123
+# 依据：docs/design-motion-transfer.md §32.5
 
 name: Win-CUDA12 only
 
@@ -57,27 +57,50 @@ jobs:
 
       - name: Pack artifacts
         run: |
+          # 🔴 两个路径都要判：Ninja 是单配置 generator，产物直接落在 build\bin，
+          #    没有 Release 子目录（多配置 generator 如 VS 才有）。
+          #    2026-10-23 第一次跑就是只判 Release 直接 throw，白跑一小时。
           $filePath = ".\build\bin\Release\*"
           if (Test-Path $filePath) {
+            echo "Exists at path $filePath"
             Copy-Item ggml/LICENSE .\build\bin\Release\ggml.txt
             Copy-Item LICENSE .\build\bin\Release\stable-diffusion.cpp.txt
+          } elseif (Test-Path ".\build\bin\stable-diffusion.dll") {
+            $filePath = ".\build\bin\*"
+            echo "Exists at path $filePath"
+            Copy-Item ggml/LICENSE .\build\bin\ggml.txt
+            Copy-Item LICENSE .\build\bin\stable-diffusion.cpp.txt
           } else {
             ls .\build\bin
             throw "Can't find stable-diffusion.dll"
           }
           7z a sd-win-cuda12-x64.zip $filePath
+          # 产物兜底自检：打完就验，别等到本地才发现包是空的
+          if (-not (Test-Path sd-win-cuda12-x64.zip)) { throw "zip not produced" }
+          7z l sd-win-cuda12-x64.zip | Select-String "stable-diffusion.dll|sd-server.exe|ggml-cuda.dll"
 
       - name: Pack Cuda runtime
         run: |
+          # 🔴 这一步在上次失败的 CI 里根本没跑到（Pack 先 throw 了），所以**零验证**。
+          #    补上自检：缺运行时不会报错，只会"能启动、能出图、但极慢"（悄悄退回 CPU），
+          #    是最难查的失败形态。
           $dst = '.\build\bin\cudart\'
           robocopy "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           # robocopy 退出码 0-7 都算成功（1 = 有文件被复制），>=8 才是失败
           if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
+
+          $dlls = @(Get-ChildItem -Path $dst -Filter *.dll -ErrorAction SilentlyContinue)
+          ls $dst
+          if ($dlls.Count -lt 3) { throw "cudart dir has only $($dlls.Count) dll(s), expected >= 3" }
+
           7z a sd-cudart-win-cu12-x64.zip $dst\*
+          if (-not (Test-Path sd-cudart-win-cu12-x64.zip)) { throw "cudart zip not produced" }
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
+          # 缺文件默认只是 warn（会给一个残缺产物，很难发现）→ 改成直接失败
+          if-no-files-found: error
           name: sd-win-cuda12-x64
           path: |
             sd-win-cuda12-x64.zip
