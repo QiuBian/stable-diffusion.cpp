@@ -20,7 +20,7 @@
 #
 # 来源：照抄上游 build.yml 的 windows-latest-cmake 中 cuda12 那一档，
 #      仅删掉 Vulkan / Node / pnpm（前端与 docker 才用得到）。
-# 依据：docs/design-motion-transfer.md §32.5
+# 依据：docs/design-motion-transfer.md §32.5/123
 
 name: Win-CUDA12 only
 
