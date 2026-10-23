@@ -565,6 +565,25 @@ namespace sd::pipeline {
         return out;
     }
 
+    // All-zero ("nothing corresponds") packed mask, shaped exactly like
+    // pack_scail2_masks() would shape it for `frames` frames.
+    //
+    // Reuses the packer instead of re-deriving T_lat = (frames-1)/stride + 1,
+    // so the two can never drift apart.  A black pixel makes every one of the
+    // 7 colour channels zero -- each channel is a product containing at least
+    // one of R/G/B -- so feeding black frames really does produce an all-zero
+    // mask.  The source "frame" is passed at latent resolution, which makes the
+    // packer's source->bin mapping the identity and keeps its inner loop at
+    // O(latent pixels) instead of O(pixels * frames).
+    static sd::Tensor<float> empty_scail2_masks(int W_lat, int H_lat, int frames) {
+        if (frames <= 0 || W_lat <= 0 || H_lat <= 0) {
+            return sd::Tensor<float>();
+        }
+        auto black = sd::full<float>({W_lat, H_lat, 1, 3, 1}, 0.f);  // planar RGB
+        std::vector<sd::Tensor<float>> v(static_cast<size_t>(frames), black);
+        return pack_scail2_masks(v, W_lat, H_lat);
+    }
+
     // Append `SCAIL2_EXTRA_MASK_CHANNELS` constant channels to a 16-channel VAE
     // latent ([w, h, t, 16{, b}] -> [w, h, t, 20]).  SCAIL-2 uses ones for the
     // reference / pose latents and zeros for the noisy video latent.
@@ -1336,7 +1355,18 @@ namespace sd::pipeline {
                              (int)latents.scail2.ref_masks.shape()[2], (int)expected);
                 }
             } else {
-                LOG_WARN("SCAIL-2: no scail_ref_masks supplied -- animation quality degrades towards replacement mode");
+                // 🔴 Upstream documents the correspondence masks as optional
+                // ("degrades towards replacement mode"), but wan.hpp's forward
+                // asserts all three conditioning tensors are non-null -- and
+                // GGML_ASSERT *aborts the process*, so "optional" would mean
+                // "crash with no readable message".  Feed an all-zero mask
+                // instead: it genuinely means "nothing corresponds", i.e. the
+                // degenerate case the README describes, and it keeps every
+                // tensor shape honest so the rest of the pipeline (RoPE, token
+                // order, slicing) stays testable without SAM3.
+                latents.scail2.ref_masks = empty_scail2_masks(latent_w, latent_h, request->frames);
+                LOG_WARN("SCAIL-2: no scail_ref_masks supplied -- using an all-zero mask "
+                         "(no correspondence; output degrades towards replacement mode)");
             }
 
             if (sd_vid_gen_params->scail_driving_masks_size > 0) {
@@ -1350,7 +1380,11 @@ namespace sd::pipeline {
                          (int)mask_frames.size(), latent_w / 2, latent_h / 2,
                          (int)latents.scail2.driving_masks.shape()[2], SCAIL2_MASK_CHANNELS);
             } else {
-                LOG_WARN("SCAIL-2: no scail_driving_masks supplied -- animation quality degrades towards replacement mode");
+                // Same reasoning as the reference mask above: a missing driving
+                // mask must not abort inside patch_embedding_mask's consumer.
+                latents.scail2.driving_masks = empty_scail2_masks(latent_w / 2, latent_h / 2, request->frames);
+                LOG_WARN("SCAIL-2: no scail_driving_masks supplied -- using an all-zero mask "
+                         "(no correspondence; output degrades towards replacement mode)");
             }
 
             // (4) the noisy video latent itself carries 4 ZERO mask channels, so
