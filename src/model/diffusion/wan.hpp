@@ -1134,7 +1134,23 @@ namespace WAN {
                 const int pw               = std::get<2>(config.patch_size);
                 const int base_video_shift = 1;  // animation mode
 
-                auto ref_pe   = Rope::gen_wan_pe_ex(pt, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, 0, 0, 0);
+                // The reference latent is prepended on the time axis inside
+                // Wan::forward() -- so the RoPE reference segment has to be
+                // generated from the SAME tensor, or `pe` ends up with a
+                // different position count than the token stream and the failure
+                // surfaces as an opaque `GGML_ASSERT(ggml_can_repeat(b, a))`
+                // inside ggml_mul.  Mirror the segment unconditionally present /
+                // absent, and log the arithmetic when it disagrees.
+                const int ref_frames = ref_latent != nullptr ? static_cast<int>(ref_latent->ne[2]) : 0;
+                if (ref_frames == 0) {
+                    LOG_ERROR("SCAIL-2 needs a reference latent (ref_latents[0]); the RoPE "
+                              "reference segment cannot be sized without it");
+                }
+
+                std::vector<float> ref_pe;
+                if (ref_frames > 0) {
+                    ref_pe = Rope::gen_wan_pe_ex(ref_frames, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, 0, 0, 0);
+                }
                 auto video_pe = Rope::gen_wan_pe_ex(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 0);
                 auto pose_pe  = Rope::gen_wan_pe_pose_half(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 120);
 
@@ -1142,6 +1158,21 @@ namespace WAN {
                 pe_vec.insert(pe_vec.end(), ref_pe.begin(), ref_pe.end());
                 pe_vec.insert(pe_vec.end(), video_pe.begin(), video_pe.end());
                 pe_vec.insert(pe_vec.end(), pose_pe.begin(), pose_pe.end());
+
+                // Cross-check against the token stream the DiT will actually see:
+                //   [ref frames][video frames] on the h/w grid, then [pose] on the
+                //   half-resolution grid.
+                int64_t expect_tokens = ((int64_t)ref_frames + T) / pt * (H / ph) * (W / pw);
+                if (pose_latents != nullptr) {
+                    expect_tokens += ((int64_t)pose_latents->ne[2] / pt) *
+                                     (pose_latents->ne[1] / ph) * (pose_latents->ne[0] / pw);
+                }
+                int64_t got_tokens = (int64_t)pe_vec.size() / config.axes_dim_sum / 2;
+                if (expect_tokens != got_tokens) {
+                    LOG_ERROR("SCAIL-2 RoPE position count %lld does not match the token "
+                              "stream %lld (ref_frames=%d T=%d H=%d W=%d)",
+                              (long long)got_tokens, (long long)expect_tokens, ref_frames, T, H, W);
+                }
             } else {
             pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
                                       static_cast<int>(x->ne[1]),

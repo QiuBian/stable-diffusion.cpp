@@ -2002,6 +2002,16 @@ sd::Tensor<float> StableDiffusionGGML::get_clip_vision_output(const sd::Tensor<f
                                                               int clip_skip,
                                                               bool zero_out_masked) {
     sd::Tensor<float> output;
+    // Upstream dereferences `clip_vision` unconditionally.  When the model was
+    // not built with a CLIP vision tower (see the get_desc() whitelist in
+    // model_builders.cpp) that is a null-pointer access violation, which on
+    // Windows kills the whole process with 0xC0000005 and no message at all.
+    // Fail loudly instead so the caller can log a usable error.
+    if (clip_vision == nullptr) {
+        LOG_ERROR("clip vision model is not loaded -- start the engine with --clip_vision "
+                  "pointing at clip_vision_h.safetensors");
+        return {};
+    }
     if (zero_out_masked) {
         if (return_pooled) {
             output = sd::zeros<float>({clip_vision->vision_model.projection_dim});

@@ -257,9 +257,16 @@ namespace sd::model_builders {
                                                                                version,
                                                                                weight_manager);
             }
+            // SCAIL-2-14B is a Wan2.1-I2V-14B derivative: it keeps the very same
+            // CLIP ViT-H branch (clip_fea -> img_emb) and upstream asserts
+            // `clip_fea is not None`.  Leaving it out of this list leaves
+            // `clip_vision == nullptr`, and get_clip_vision_output() then
+            // dereferences it -- a null-pointer 0xC0000005 during generation,
+            // not a readable error.
             if (result.diffusion->get_desc() == "Wan2.1-I2V-14B" ||
                 result.diffusion->get_desc() == "Wan2.1-FLF2V-14B" ||
-                result.diffusion->get_desc() == "Wan2.1-I2V-1.3B") {
+                result.diffusion->get_desc() == "Wan2.1-I2V-1.3B" ||
+                result.diffusion->get_desc() == "SCAIL-2-14B") {
                 if (!ensure_backend_pair(ctx.backends, SDBackendModule::CLIP_VISION)) {
                     return false;
                 }

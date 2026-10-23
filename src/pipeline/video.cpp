@@ -565,23 +565,30 @@ namespace sd::pipeline {
         return out;
     }
 
-    // All-zero ("nothing corresponds") packed mask, shaped exactly like
-    // pack_scail2_masks() would shape it for `frames` frames.
+    // All-zero ("nothing corresponds") packed mask with EXACTLY `packed_frames`
+    // packed frames -- shaped exactly like pack_scail2_masks() would shape it.
     //
-    // Reuses the packer instead of re-deriving T_lat = (frames-1)/stride + 1,
-    // so the two can never drift apart.  A black pixel makes every one of the
-    // 7 colour channels zero -- each channel is a product containing at least
-    // one of R/G/B -- so feeding black frames really does produce an all-zero
-    // mask.  The source "frame" is passed at latent resolution, which makes the
-    // packer's source->bin mapping the identity and keeps its inner loop at
-    // O(latent pixels) instead of O(pixels * frames).
-    static sd::Tensor<float> empty_scail2_masks(int W_lat, int H_lat, int frames) {
-        if (frames <= 0 || W_lat <= 0 || H_lat <= 0) {
+    // Reuses the packer instead of re-deriving its own layout.  A black pixel
+    // makes every one of the 7 colour channels zero -- each channel is a product
+    // containing at least one of R/G/B -- so feeding black frames really does
+    // produce an all-zero mask.  The source "frame" is passed at latent
+    // resolution, which makes the packer's source->bin mapping the identity and
+    // keeps its inner loop at O(latent pixels) instead of O(pixels * frames).
+    //
+    // `packed_frames` (not source frames) is the argument because the caller
+    // thinks in latent time: SCAIL-2 prepends the reference frame on the time
+    // axis, so the reference mask needs 1 + T_lat while the driving mask needs
+    // T_lat.  The inversion is checked against the packer so it cannot drift.
+    static sd::Tensor<float> empty_scail2_masks(int W_lat, int H_lat, int packed_frames) {
+        if (packed_frames <= 0 || W_lat <= 0 || H_lat <= 0) {
             return sd::Tensor<float>();
         }
         auto black = sd::full<float>({W_lat, H_lat, 1, 3, 1}, 0.f);  // planar RGB
-        std::vector<sd::Tensor<float>> v(static_cast<size_t>(frames), black);
-        return pack_scail2_masks(v, W_lat, H_lat);
+        const int src_frames = (packed_frames - 1) * SCAIL2_TEMPORAL_STRIDE + 1;
+        std::vector<sd::Tensor<float>> v(static_cast<size_t>(src_frames), black);
+        auto out = pack_scail2_masks(v, W_lat, H_lat);
+        GGML_ASSERT(out.shape()[2] == packed_frames);
+        return out;
     }
 
     // Append `SCAIL2_EXTRA_MASK_CHANNELS` constant channels to a 16-channel VAE
@@ -1335,6 +1342,7 @@ namespace sd::pipeline {
             //     mode but still runs (upstream README).
             const int latent_w = request->width / request->vae_scale_factor;
             const int latent_h = request->height / request->vae_scale_factor;
+            const int t_lat    = (int)sd->video_frames_to_latent_frames(request->frames);
 
             if (sd_vid_gen_params->scail_ref_masks_size > 0) {
                 std::vector<sd::Tensor<float>> mask_frames;
@@ -1364,7 +1372,9 @@ namespace sd::pipeline {
                 // degenerate case the README describes, and it keeps every
                 // tensor shape honest so the rest of the pipeline (RoPE, token
                 // order, slicing) stays testable without SAM3.
-                latents.scail2.ref_masks = empty_scail2_masks(latent_w, latent_h, request->frames);
+                // 1 + T_lat: the forward prepends the reference frame on the
+                // time axis, so the reference mask covers ref + every frame.
+                latents.scail2.ref_masks = empty_scail2_masks(latent_w, latent_h, t_lat + 1);
                 LOG_WARN("SCAIL-2: no scail_ref_masks supplied -- using an all-zero mask "
                          "(no correspondence; output degrades towards replacement mode)");
             }
@@ -1382,7 +1392,7 @@ namespace sd::pipeline {
             } else {
                 // Same reasoning as the reference mask above: a missing driving
                 // mask must not abort inside patch_embedding_mask's consumer.
-                latents.scail2.driving_masks = empty_scail2_masks(latent_w / 2, latent_h / 2, request->frames);
+                latents.scail2.driving_masks = empty_scail2_masks(latent_w / 2, latent_h / 2, t_lat);
                 LOG_WARN("SCAIL-2: no scail_driving_masks supplied -- using an all-zero mask "
                          "(no correspondence; output degrades towards replacement mode)");
             }
@@ -1457,6 +1467,17 @@ namespace sd::pipeline {
                 embeds.cond.c_ref_audios = {latents.s2v_audio_embed};
             }
         }
+        // SCAIL-2 reaches the DiT through the very same ref_latents[0] slot as
+        // S2V -- Wan::compute() picks it up whenever `wants_ref` is true, and
+        // Wan::forward() prepends it on the TIME axis (unlike S2V, which
+        // appends on the sequence axis).  Forgetting this copy leaves
+        // `reference_latent == nullptr`, the reference frame never enters the
+        // token stream, and the three-segment RoPE then has more positions than
+        // there are tokens -- an opaque `GGML_ASSERT(ggml_can_repeat(b,a))`
+        // inside ggml_mul instead of a usable error.
+        if (sd->diffusion_model->get_desc() == "SCAIL-2-14B") {
+            embeds.cond.c_ref_images = latents.ref_latents;
+        }
         if (request.use_uncond) {
             condition_params.text = request.negative_prompt;
             embeds.uncond         = sd->get_learned_condition(condition_params);
@@ -1477,6 +1498,11 @@ namespace sd::pipeline {
                 if (!latents.s2v_audio_embed.empty()) {
                     embeds.uncond.c_ref_audios = {sd::Tensor<float>::zeros_like(latents.s2v_audio_embed)};
                 }
+            }
+            // See the cond-side copy above: SCAIL-2 needs ref_latents[0] on both
+            // branches, otherwise the CFG pair would disagree on token count.
+            if (sd->diffusion_model->get_desc() == "SCAIL-2-14B") {
+                embeds.uncond.c_ref_images = latents.ref_latents;
             }
         }
 
