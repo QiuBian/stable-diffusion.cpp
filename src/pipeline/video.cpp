@@ -461,6 +461,132 @@ namespace sd::pipeline {
         return window;
     }
 
+    // ============================== SCAIL-2 ==================================
+    //
+    // Correspondence masks are pure pixel maths -- they never go through the VAE:
+    //   RGB (7-colour coded) -> binarise R/G/B -> 7 mutually exclusive binary
+    //   channels -> area-downsample to latent resolution -> pack `stride` frames
+    //   together -> 28 = 4 x 7 channels.
+    //
+    // Port of SCAIL-2 `scail_utils.py::extract_and_compress_mask_to_latent`.
+    //
+    // The reference impl thresholds at 0.765 because its tensors live in [-1, 1]
+    // ((225 - 127.5) / 127.5).  Our image tensors are [0, 1], so the equivalent
+    // cutoff for "raw pixel >= 225" is 225 / 255.
+    static constexpr float SCAIL2_ON_THRESHOLD    = 225.0f / 255.0f;
+    static constexpr int SCAIL2_TEMPORAL_STRIDE   = 4;
+    static constexpr int SCAIL2_COLOR_COUNT       = 7;
+    static constexpr int SCAIL2_MASK_CHANNELS     = SCAIL2_TEMPORAL_STRIDE * SCAIL2_COLOR_COUNT;  // 28
+    static constexpr int SCAIL2_EXTRA_MASK_CHANNELS = 4;  // appended to the 16 VAE channels
+
+    // `frames`: one [w, h, 1, 3] tensor per video frame, values in [0, 1].
+    // Returns [W_lat, H_lat, T_lat, 28] -- i.e. 28 "channels" on axis 3.
+    static sd::Tensor<float> pack_scail2_masks(const std::vector<sd::Tensor<float>>& frames,
+                                               int W_lat,
+                                               int H_lat) {
+        const int T = static_cast<int>(frames.size());
+        if (T <= 0 || W_lat <= 0 || H_lat <= 0) {
+            return sd::Tensor<float>();
+        }
+        if ((T - 1) % SCAIL2_TEMPORAL_STRIDE != 0) {
+            // The reference impl's temporal packing silently assumes this.
+            LOG_WARN("SCAIL-2 mask has %d frames; the temporal packing expects 4k+1 "
+                     "(the tail will be clamped)",
+                     T);
+        }
+        const int T_lat = (T - 1) / SCAIL2_TEMPORAL_STRIDE + 1;
+
+        sd::Tensor<float> out = sd::full<float>({W_lat, H_lat, T_lat, SCAIL2_MASK_CHANNELS}, 0.f);
+        float* dst            = out.data();
+
+        const int src_w = static_cast<int>(frames[0].shape()[0]);
+        const int src_h = static_cast<int>(frames[0].shape()[1]);
+
+        // Per-frame scratch: 7 binary channels at latent resolution.
+        std::vector<float> acc(static_cast<size_t>(H_lat) * W_lat * SCAIL2_COLOR_COUNT, 0.f);
+
+        // Accumulate every source frame into its packed slot.
+        // padded[i] = i < stride ? 0 : i - stride + 1  (first frame is repeated
+        // `stride` times -- see the reference impl) and
+        // packed[p][s*7 + c] = binary_7ch[padded[p*stride + s]][c].
+        for (int p = 0; p < T_lat; ++p) {
+            for (int s = 0; s < SCAIL2_TEMPORAL_STRIDE; ++s) {
+                const int i   = p * SCAIL2_TEMPORAL_STRIDE + s;
+                int src_frame = i < SCAIL2_TEMPORAL_STRIDE ? 0 : i - SCAIL2_TEMPORAL_STRIDE + 1;
+                if (src_frame >= T) {
+                    src_frame = T - 1;  // clamp instead of reading out of range
+                }
+
+                std::fill(acc.begin(), acc.end(), 0.f);
+                std::vector<int> counts(static_cast<size_t>(H_lat) * W_lat, 0);
+
+                const float* rgb = frames[src_frame].data();  // [w, h, 1, 3], planar RGB
+                for (int y = 0; y < src_h; ++y) {
+                    const int by = y * H_lat / src_h;
+                    for (int x = 0; x < src_w; ++x) {
+                        const int bx = x * W_lat / src_w;
+                        const size_t bin_idx = static_cast<size_t>(by) * W_lat + bx;
+
+                        const float r = rgb[static_cast<size_t>(y) * src_w + x];
+                        const float g = rgb[static_cast<size_t>(src_h) * src_w + y * src_w + x];
+                        const float b = rgb[static_cast<size_t>(2) * src_h * src_w + y * src_w + x];
+
+                        const float R  = r > SCAIL2_ON_THRESHOLD ? 1.f : 0.f;
+                        const float G  = g > SCAIL2_ON_THRESHOLD ? 1.f : 0.f;
+                        const float B  = b > SCAIL2_ON_THRESHOLD ? 1.f : 0.f;
+                        const float nR = 1.f - R, nG = 1.f - G, nB = 1.f - B;
+
+                        // white / red / green / blue / yellow / magenta / cyan
+                        float* a = acc.data() + bin_idx * SCAIL2_COLOR_COUNT;
+                        a[0] += R * G * B;
+                        a[1] += R * nG * nB;
+                        a[2] += nR * G * nB;
+                        a[3] += nR * nG * B;
+                        a[4] += R * G * nB;
+                        a[5] += R * nG * B;
+                        a[6] += nR * G * B;
+                        counts[bin_idx]++;
+                    }
+                }
+
+                // area downsample == mean of the bin
+                for (size_t bin = 0; bin < counts.size(); ++bin) {
+                    if (counts[bin] <= 0) {
+                        continue;
+                    }
+                    const float inv = 1.f / static_cast<float>(counts[bin]);
+                    const float* a  = acc.data() + bin * SCAIL2_COLOR_COUNT;
+                    for (int c = 0; c < SCAIL2_COLOR_COUNT; ++c) {
+                        dst[(static_cast<size_t>(s * SCAIL2_COLOR_COUNT + c) * T_lat + p) * H_lat * W_lat + bin] = a[c] * inv;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    // Append `SCAIL2_EXTRA_MASK_CHANNELS` constant channels to a 16-channel VAE
+    // latent ([w, h, t, 16{, b}] -> [w, h, t, 20]).  SCAIL-2 uses ones for the
+    // reference / pose latents and zeros for the noisy video latent.
+    static sd::Tensor<float> scail2_append_mask_channels(const sd::Tensor<float>& latent, float value) {
+        if (latent.empty()) {
+            return sd::Tensor<float>();
+        }
+        const bool batched = latent.dim() == 5;
+        std::vector<int64_t> mask_shape;
+        if (batched) {
+            mask_shape = {latent.shape()[0], latent.shape()[1], latent.shape()[2], SCAIL2_EXTRA_MASK_CHANNELS, latent.shape()[4]};
+        } else {
+            mask_shape = {latent.shape()[0], latent.shape()[1], latent.shape()[2], SCAIL2_EXTRA_MASK_CHANNELS};
+        }
+        auto mask = sd::full<float>(mask_shape, value);
+        auto out  = sd::ops::concat(latent, mask, 3);
+        if (batched) {
+            out = out.reshape({out.shape()[0], out.shape()[1], out.shape()[2], out.shape()[3]});
+        }
+        return out;
+    }
+
     static std::optional<ImageGenerationLatents> prepare_video_generation_latents(StableDiffusionGGML* sd,
                                                                                   const sd_vid_gen_params_t* sd_vid_gen_params,
                                                                                   GenerationRequest* request) {
@@ -1125,6 +1251,118 @@ namespace sd::pipeline {
             }
             int64_t t2 = ggml_time_ms();
             LOG_INFO("s2v conditioning prepared, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd->diffusion_model->get_desc() == "SCAIL-2-14B") {
+            // ---- SCAIL-2 character animation --------------------------------
+            // Five DiT inputs: the noisy video latent (built elsewhere, and the
+            // 4 zero mask channels are appended below), the reference latent,
+            // the pose latent, and the two packed correspondence masks.
+            int64_t t1 = ggml_time_ms();
+
+            if (start_image.empty()) {
+                LOG_ERROR("SCAIL-2 requires a reference image (start_image)");
+                return std::nullopt;
+            }
+
+            // (0) CLIP vision features -> `clip_fea` -> img_emb.
+            // Same "hidden initialisation" trap as ref_images below: every other
+            // i2v-style branch fills this inside its own body, so an `else if`
+            // that forgets it silently produces img_emb == zeros.  SCAIL-2
+            // asserts `clip_fea is not None` upstream, hence the hard error.
+            auto clip_vision_output = sd->get_clip_vision_output(start_image, false, -2);
+            if (clip_vision_output.empty()) {
+                LOG_ERROR("SCAIL-2 needs CLIP vision features for the reference image, but "
+                          "get_clip_vision_output() returned nothing -- start the engine with "
+                          "--clip-vision pointing at clip_vision_h.safetensors");
+                return std::nullopt;
+            }
+            latents.clip_vision_output = std::move(clip_vision_output);
+
+            // (1) reference latent: 16 VAE channels + 4 "ones" => 20 channels
+            auto ref_img     = start_image.reshape({start_image.shape()[0], start_image.shape()[1], 1, start_image.shape()[2], 1});
+            auto encoded_ref = sd->encode_first_stage(ref_img);
+            if (encoded_ref.empty()) {
+                LOG_ERROR("failed to encode SCAIL-2 reference image");
+                return std::nullopt;
+            }
+            latents.ref_latents.push_back(scail2_append_mask_channels(encoded_ref, 1.f));
+
+            // 🔴 CLIP features.  SCAIL-2 asserts `clip_fea is not None` upstream and
+            // builds img_emb from it.  latents.ref_images is what feeds
+            // condition_params.ref_images, and every other i2v-flavoured branch
+            // fills it inside its own branch -- so it has to happen here too, or
+            // the reference image is silently ignored (the exact failure mode
+            // described in design-motion-transfer.md section 36.5).
+            latents.ref_images.push_back(start_image);
+
+            // (2) pose latent: the driving video, VAE-encoded at HALF spatial
+            //     resolution (the pose branch runs on a half-res grid), + 4 ones.
+            const int half_w = request->width / 2;
+            const int half_h = request->height / 2;
+            sd::Tensor<float> driving = sd::full<float>({half_w, half_h, request->frames, 3, 1}, 0.5f);
+            int64_t driving_count     = std::min<int64_t>(request->frames, sd_vid_gen_params->control_frames_size);
+            for (int64_t i = 0; i < driving_count; ++i) {
+                auto frame = sd_image_to_tensor(sd_vid_gen_params->control_frames[i], half_w, half_h);
+                sd::ops::slice_assign(&driving, 2, i, i + 1, frame.unsqueeze(2));
+            }
+            auto pose_encoded = sd->encode_first_stage(driving);
+            if (pose_encoded.empty()) {
+                LOG_ERROR("failed to encode SCAIL-2 driving video (control_frames)");
+                return std::nullopt;
+            }
+            latents.scail2.pose_latents = scail2_append_mask_channels(pose_encoded, 1.f);
+
+            // (3) correspondence masks: RGB frames -> 28-channel packed latents.
+            //     Optional: without them SCAIL-2 degrades towards replacement
+            //     mode but still runs (upstream README).
+            const int latent_w = request->width / request->vae_scale_factor;
+            const int latent_h = request->height / request->vae_scale_factor;
+
+            if (sd_vid_gen_params->scail_ref_masks_size > 0) {
+                std::vector<sd::Tensor<float>> mask_frames;
+                mask_frames.reserve(sd_vid_gen_params->scail_ref_masks_size);
+                for (int i = 0; i < sd_vid_gen_params->scail_ref_masks_size; ++i) {
+                    mask_frames.push_back(sd_image_to_tensor(sd_vid_gen_params->scail_ref_masks[i], request->width, request->height));
+                }
+                latents.scail2.ref_masks = pack_scail2_masks(mask_frames, latent_w, latent_h);
+                LOG_INFO("SCAIL-2 ref masks: %d RGB frames -> [%d, %d, %d, %d]",
+                         (int)mask_frames.size(), latent_w, latent_h,
+                         (int)latents.scail2.ref_masks.shape()[2], SCAIL2_MASK_CHANNELS);
+                // SCAIL-2's forward expects the reference mask to cover the ref
+                // frame plus every video frame, i.e. 1 + F packed frames.
+                int64_t expected = request->frames > 0 ? sd->video_frames_to_latent_frames(request->frames) + 1 : 0;
+                if (latents.scail2.ref_masks.shape()[2] != expected) {
+                    LOG_WARN("SCAIL-2 ref mask has %d packed frames but the forward expects %d "
+                             "(reference frame + video frames); verify the mask input length",
+                             (int)latents.scail2.ref_masks.shape()[2], (int)expected);
+                }
+            } else {
+                LOG_WARN("SCAIL-2: no scail_ref_masks supplied -- animation quality degrades towards replacement mode");
+            }
+
+            if (sd_vid_gen_params->scail_driving_masks_size > 0) {
+                std::vector<sd::Tensor<float>> mask_frames;
+                mask_frames.reserve(sd_vid_gen_params->scail_driving_masks_size);
+                for (int i = 0; i < sd_vid_gen_params->scail_driving_masks_size; ++i) {
+                    mask_frames.push_back(sd_image_to_tensor(sd_vid_gen_params->scail_driving_masks[i], request->width, request->height));
+                }
+                latents.scail2.driving_masks = pack_scail2_masks(mask_frames, latent_w / 2, latent_h / 2);
+                LOG_INFO("SCAIL-2 driving masks: %d RGB frames -> [%d, %d, %d, %d]",
+                         (int)mask_frames.size(), latent_w / 2, latent_h / 2,
+                         (int)latents.scail2.driving_masks.shape()[2], SCAIL2_MASK_CHANNELS);
+            } else {
+                LOG_WARN("SCAIL-2: no scail_driving_masks supplied -- animation quality degrades towards replacement mode");
+            }
+
+            // (4) the noisy video latent itself carries 4 ZERO mask channels, so
+            //     the DiT input width becomes 20 instead of 16.
+            latents.concat_latent = sd::full<float>({latent_w, latent_h,
+                                                     sd->video_frames_to_latent_frames(request->frames),
+                                                     SCAIL2_EXTRA_MASK_CHANNELS},
+                                                    0.f);
+            latents.ref_image_num = 1;
+
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("scail-2 conditioning prepared, taking %" PRId64 " ms", t2 - t1);
         }
 
         if (latents.init_latent.empty()) {
@@ -1659,7 +1897,8 @@ namespace sd::pipeline {
                                                        static_cast<float>(request.fps),
                                                        request.cache_params,
                                                        true,
-                                                       latents.video_positions);
+                                                       latents.video_positions,
+                                                       latents.scail2);
             int64_t sampling_end          = ggml_time_ms();
             if (x_t_sampled.empty()) {
                 LOG_ERROR("sampling(high noise) failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
@@ -1702,7 +1941,8 @@ namespace sd::pipeline {
                                                     static_cast<float>(request.fps),
                                                     request.cache_params,
                                                     plan.high_noise_sample_steps <= 0,
-                                                    latents.video_positions);
+                                                    latents.video_positions,
+                                                    latents.scail2);
 
         int64_t sampling_end = ggml_time_ms();
         if (final_latent.empty()) {

@@ -799,6 +799,98 @@ namespace Rope {
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
     }
 
+    // SCAIL-2: same as gen_wan_pe but also forwards the h/w offsets.
+    // gen_vid_ids() already supports h_offset/w_offset natively; gen_wan_pe()
+    // simply never forwarded them.
+    __STATIC_INLINE__ std::vector<float> gen_wan_pe_ex(int t,
+                                                       int h,
+                                                       int w,
+                                                       int pt,
+                                                       int ph,
+                                                       int pw,
+                                                       int bs,
+                                                       int theta,
+                                                       const std::vector<int>& axes_dim,
+                                                       int t_offset = 0,
+                                                       int h_offset = 0,
+                                                       int w_offset = 0) {
+        std::vector<std::vector<float>> ids = gen_vid_ids(t, h, w, pt, ph, pw, bs, t_offset, h_offset, w_offset);
+        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
+    }
+
+    // SCAIL-2 pose branch.
+    //
+    // The reference implementation (wan/modules/model_scail2.py::rope_apply_pose)
+    // builds the RoPE frequencies on the FULL resolution grid and then applies
+    //   F.avg_pool2d(..., kernel_size=2, stride=2)
+    // to the real and imaginary parts separately.  That is NOT the same as
+    // generating ids on a half-resolution grid: cos/sin are non-linear, so
+    //   avg(cos(a), cos(b)) != cos(avg(a, b)).
+    // We therefore reproduce the pooling on the already-materialised pe vector.
+    //
+    // pe layout (see embed_nd): per position, emb_dim * 2 * 2 contiguous floats,
+    // position index = i * h_len * w_len + j * w_len + k  (t / h / w, w innermost).
+    // Averaging the 4 components [cos, sin, -sin, cos] independently is
+    // mathematically equivalent to pooling real & imag, since avg(-s) == -avg(s).
+    //
+    // h_len and w_len must be even.
+    __STATIC_INLINE__ std::vector<float> gen_wan_pe_pose_half(int t,
+                                                              int h,
+                                                              int w,
+                                                              int pt,
+                                                              int ph,
+                                                              int pw,
+                                                              int bs,
+                                                              int theta,
+                                                              const std::vector<int>& axes_dim,
+                                                              int t_offset = 0,
+                                                              int h_offset = 0,
+                                                              int w_offset = 0) {
+        std::vector<float> pe = gen_wan_pe_ex(t, h, w, pt, ph, pw, bs, theta, axes_dim, t_offset, h_offset, w_offset);
+
+        int emb_len = 0;
+        for (int d : axes_dim) {
+            emb_len += d / 2;
+        }
+        emb_len *= 4;  // emb_dim * 2 * 2
+
+        const int t_len = (t + (pt / 2)) / pt;
+        const int h_len = (h + (ph / 2)) / ph;
+        const int w_len = (w + (pw / 2)) / pw;
+        GGML_ASSERT(h_len % 2 == 0 && w_len % 2 == 0);
+
+        const int h2 = h_len / 2;
+        const int w2 = w_len / 2;
+
+        std::vector<float> out(static_cast<size_t>(bs) * t_len * h2 * w2 * emb_len, 0.f);
+        for (int b = 0; b < bs; ++b) {
+            for (int i = 0; i < t_len; ++i) {
+                for (int j2 = 0; j2 < h2; ++j2) {
+                    for (int k2 = 0; k2 < w2; ++k2) {
+                        size_t dst = (static_cast<size_t>(b) * t_len * h2 * w2 +
+                                      static_cast<size_t>(i) * h2 * w2 +
+                                      static_cast<size_t>(j2) * w2 + k2) * emb_len;
+                        for (int dj = 0; dj < 2; ++dj) {
+                            for (int dk = 0; dk < 2; ++dk) {
+                                size_t src = (static_cast<size_t>(b) * t_len * h_len * w_len +
+                                              static_cast<size_t>(i) * h_len * w_len +
+                                              static_cast<size_t>(j2 * 2 + dj) * w_len +
+                                              (k2 * 2 + dk)) * emb_len;
+                                for (int c = 0; c < emb_len; ++c) {
+                                    out[dst + c] += pe[src + c];
+                                }
+                            }
+                        }
+                        for (int c = 0; c < emb_len; ++c) {
+                            out[dst + c] *= 0.25f;
+                        }
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_lingbot_video_ids(int t,
                                                                             int h,
                                                                             int w,

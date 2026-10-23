@@ -81,6 +81,7 @@ const char* model_version_to_str[] = {
     "Wan 2.2 I2V",
     "Wan 2.2 TI2V",
     "Wan 2.2 S2V",
+    "SCAIL-2",
     "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
@@ -2421,8 +2422,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                               int audio_length,
                                               float frame_rate,
                                               const sd_cache_params_t* cache_params,
-                                              bool preview_final_step,
-                                              const sd::Tensor<float>& video_positions) {
+                              bool preview_final_step,
+                              const sd::Tensor<float>& video_positions,
+                              const sd::pipeline::SCAIL2Conditioning& scail2) {
     struct RunnerEndOnExit {
         GGMLRunner* runner = nullptr;
         ~RunnerEndOnExit() {
@@ -2670,7 +2672,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             } else if (sd_version_is_wan(version)) {
                 diffusion_params.extra = WanDiffusionExtra{vace_context.empty() ? nullptr : &vace_context,
                                                            vace_strength,
-                                                           condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios[0]};
+                                                           condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios[0],
+                                                           scail2.pose_latents.empty() ? nullptr : &scail2.pose_latents,
+                                                           scail2.ref_masks.empty() ? nullptr : &scail2.ref_masks,
+                                                           scail2.driving_masks.empty() ? nullptr : &scail2.driving_masks};
             } else if (sd_version_is_hunyuan_video(version)) {
                 diffusion_params.extra = HunyuanVideoDiffusionExtra{
                     &guidance_tensor,

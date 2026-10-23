@@ -440,6 +440,15 @@ typedef struct {
     int ref_audios_count;
     sd_image_t* control_frames;
     int control_frames_size;
+    // SCAIL-2 correspondence masks.  7-colour coded RGB frames at the ORIGINAL
+    // pixel resolution; they bypass the VAE and get packed into 28-channel
+    // latents by the pipeline.  Optional: empty => the pose branch still runs
+    // but the model degrades towards replacement-mode behaviour (upstream
+    // README).  See docs/design-motion-transfer.md section 36.7.
+    sd_image_t* scail_ref_masks;
+    int scail_ref_masks_size;
+    sd_image_t* scail_driving_masks;
+    int scail_driving_masks_size;
     int width;
     int height;
     sd_sample_params_t sample_params;

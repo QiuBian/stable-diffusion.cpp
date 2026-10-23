@@ -216,6 +216,8 @@ static json make_vid_gen_features_json() {
         {"init_image", true},
         {"end_image", true},
         {"control_frames", true},
+        {"scail_ref_masks", true},
+        {"scail_driving_masks", true},
         {"high_noise_sample_params", true},
         {"lora", true},
         {"vae_tiling", true},

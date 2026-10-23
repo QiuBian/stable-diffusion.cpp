@@ -100,6 +100,23 @@ struct WanDiffusionExtra {
     float vace_strength                   = 1.f;
     // S2V audio, sd::Tensor layout: [dim, T_latent*4, layers].
     const sd::Tensor<float>* audio_embed = nullptr;
+
+    // ---- SCAIL-2 character animation (all nullptr => plain Wan path) ----
+    // SCAIL-2 feeds the DiT five tensors.  The noisy video latent `x` and the
+    // reference latent ride the existing channels (x / ref_latents); the three
+    // below are new and each keeps its own resolution:
+    //
+    //   pose_latents   [20, F,     H/2, W/2]  driving video, VAE-encoded at half
+    //                                         spatial resolution, + 4 "ones" ch
+    //   ref_masks      [28, 1 + F, H,   W  ]  packed correspondence mask
+    //   driving_masks  [28, F,     H/2, W/2]  packed correspondence mask
+    //
+    // H/W are LATENT dims; 28 = 4 frames packed x 7 binary colour channels.
+    // The 4 extra channels on `x` / `ref` (zeros / ones respectively) are
+    // appended by the caller, see video.cpp.
+    const sd::Tensor<float>* pose_latents   = nullptr;
+    const sd::Tensor<float>* ref_masks      = nullptr;
+    const sd::Tensor<float>* driving_masks  = nullptr;
 };
 
 struct HiDreamO1DiffusionExtra {

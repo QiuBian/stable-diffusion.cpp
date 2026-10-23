@@ -2330,7 +2330,9 @@ bool SDGenerationParams::from_json_str(
         return false;
     }
     if (!parse_image_array_json_field(j, "ref_images", 0, ref_images) ||
-        !parse_image_array_json_field(j, "control_frames", 3, control_frames)) {
+        !parse_image_array_json_field(j, "control_frames", 3, control_frames) ||
+        !parse_image_array_json_field(j, "scail_ref_masks", 3, scail_ref_masks) ||
+        !parse_image_array_json_field(j, "scail_driving_masks", 3, scail_driving_masks)) {
         LOG_ERROR("invalid input image array");
         return false;
     }
@@ -2838,6 +2840,18 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
         control_frame_views.push_back(frame.get());
     }
 
+    scail_ref_mask_views.clear();
+    scail_ref_mask_views.reserve(scail_ref_masks.size());
+    for (auto& frame : scail_ref_masks) {
+        scail_ref_mask_views.push_back(frame.get());
+    }
+
+    scail_driving_mask_views.clear();
+    scail_driving_mask_views.reserve(scail_driving_masks.size());
+    for (auto& frame : scail_driving_masks) {
+        scail_driving_mask_views.push_back(frame.get());
+    }
+
     ref_image_views.clear();
     ref_image_views.reserve(ref_images.size());
     for (auto& image : ref_images) {
@@ -2893,6 +2907,10 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.ref_audios_count          = static_cast<int>(ref_audio_views.size());
     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
     params.control_frames_size       = static_cast<int>(control_frame_views.size());
+    params.scail_ref_masks           = scail_ref_mask_views.empty() ? nullptr : scail_ref_mask_views.data();
+    params.scail_ref_masks_size      = static_cast<int>(scail_ref_mask_views.size());
+    params.scail_driving_masks       = scail_driving_mask_views.empty() ? nullptr : scail_driving_mask_views.data();
+    params.scail_driving_masks_size  = static_cast<int>(scail_driving_mask_views.size());
     params.width                     = get_resolved_width();
     params.height                    = get_resolved_height();
     params.sample_params             = sample_params;

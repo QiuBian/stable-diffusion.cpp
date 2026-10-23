@@ -302,6 +302,9 @@ struct SDGenerationParams {
     SDImageOwner ip_adapter_image;
     std::vector<SDImageOwner> pm_id_images;
     std::vector<SDImageOwner> control_frames;
+    // SCAIL-2 correspondence masks: 7-colour coded RGB frames (no VAE involved).
+    std::vector<SDImageOwner> scail_ref_masks;
+    std::vector<SDImageOwner> scail_driving_masks;
 
     // Backing storage for sd_img_gen_params_t view fields.
     std::vector<sd_image_t> ref_image_views;
@@ -310,6 +313,8 @@ struct SDGenerationParams {
     std::vector<sd_audio_t> ref_audio_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
+    std::vector<sd_image_t> scail_ref_mask_views;
+    std::vector<sd_image_t> scail_driving_mask_views;
 
     SDGenerationParams();
     SDGenerationParams(const SDGenerationParams& other)                = default;

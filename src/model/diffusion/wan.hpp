@@ -21,6 +21,11 @@ namespace WAN {
 
     struct WanConfig {
         std::string model_type                  = "t2v";
+        // SCAIL-2: an extra flag on top of model_type=="i2v" (SCAIL-2 does carry
+        // img_emb, so it must keep reusing every i2v code path -- especially the
+        // img_emb block creation at ::Wan() -- or the reference image gets ignored).
+        bool is_scail2                          = false;
+        int64_t mask_dim                        = 28;  // SCAIL-2 mask branch channels
         std::tuple<int, int, int> patch_size    = {1, 2, 2};
         int64_t text_len                        = 512;
         int64_t in_dim                          = 16;
@@ -86,6 +91,11 @@ namespace WAN {
                 }
                 if (name.find("img_emb.emb_pos") != std::string::npos) {
                     config.flf_pos_embed_token_number = 514;
+                }
+                // SCAIL-2 only: two extra parallel patch embeddings.
+                // NOTE: keep model_type at "i2v" -- see the comment on is_scail2.
+                if (name.find("patch_embedding_mask") != std::string::npos) {
+                    config.is_scail2 = true;
                 }
             }
             LOG_VERBOSE("wan: model_type = %s, num_layers = %d, vace_layers = %d, dim = %" PRId64 ", ffn_dim = %" PRId64 ", num_heads = %" PRId64,
@@ -563,6 +573,14 @@ namespace WAN {
             // patch_embedding
             blocks["patch_embedding"] = std::shared_ptr<GGMLBlock>(new Conv3d(config.in_dim, config.dim, config.patch_size, config.patch_size));
 
+            // SCAIL-2: two extra parallel patch embeddings.
+            //   patch_embedding_mask : 28ch (mask latent)  -> used TWICE (ref + driving)
+            //   patch_embedding_pose : 20ch (pose latent)  -> used once
+            if (config.is_scail2) {
+                blocks["patch_embedding_mask"] = std::shared_ptr<GGMLBlock>(new Conv3d(config.mask_dim, config.dim, config.patch_size, config.patch_size));
+                blocks["patch_embedding_pose"] = std::shared_ptr<GGMLBlock>(new Conv3d(config.in_dim, config.dim, config.patch_size, config.patch_size));
+            }
+
             // text_embedding
             blocks["text_embedding.0"] = std::shared_ptr<GGMLBlock>(new Linear(config.text_dim, config.dim));
             // text_embedding.1 is nn.GELU()
@@ -638,7 +656,14 @@ namespace WAN {
             int pad_t = (std::get<0>(config.patch_size) - T % std::get<0>(config.patch_size)) % std::get<0>(config.patch_size);
             int pad_h = (std::get<1>(config.patch_size) - H % std::get<1>(config.patch_size)) % std::get<1>(config.patch_size);
             int pad_w = (std::get<2>(config.patch_size) - W % std::get<2>(config.patch_size)) % std::get<2>(config.patch_size);
-            ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, pad_t, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            // NOTE(upstream bug fix): ggml_ext_pad() returns a NEW tensor; the
+            // upstream code dropped the return value, so the padding never
+            // happened.  It stayed unnoticed because every common resolution
+            // (e.g. 832x480 -> latent 104x60 -> patch grid 52x30) divides evenly
+            // and all three pads are 0.  SCAIL-2 additionally feeds half-res
+            // pose/mask tensors through here, which makes the latent fix worth
+            // having.  With pad == 0 the behaviour is unchanged.
+            x = ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, pad_t, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             return x;
         }
 
@@ -679,14 +704,21 @@ namespace WAN {
                                   float vace_strength           = 1.f,
                                   int64_t N                     = 1,
                                   ggml_tensor* audio_embed      = nullptr,
-                                  ggml_tensor* reference_latent = nullptr) {
+                                  ggml_tensor* reference_latent = nullptr,
+                                  ggml_tensor* pose_latents     = nullptr,
+                                  ggml_tensor* ref_masks        = nullptr,
+                                  ggml_tensor* driving_masks    = nullptr) {
             // x: [N*C, T, H, W], C => in_dim
             // vace_context: [N*vace_in_dim, T, H, W]
             // timestep: [N,] or [T]
             // context: [N, L, text_dim]
             // audio_embed: [layers, T*4, audio_dim]
-            // reference_latent: [N*C, T_ref, H, W]
-            // return: [N, (t_len [+ t_ref_len]) * h_len*w_len, out_dim*pt*ph*pw]
+            // reference_latent: [N*C, T_ref, H, W] -- S2V: appended on the
+            //   SEQUENCE axis here; SCAIL-2: already concatenated on the TIME
+            //   axis by Wan::forward() before this call.
+            // pose_latents / ref_masks / driving_masks: SCAIL-2 only, see
+            //   WanDiffusionExtra for shapes.
+            // return: [N, (t_len [+ t_ref_len] [+ pose_len]) * h_len*w_len, out_dim*pt*ph*pw]
 
             GGML_ASSERT(N == 1);
 
@@ -707,6 +739,41 @@ namespace WAN {
             x = patch_embedding->forward(ctx, x);                                                    // [N*dim, t_len, h_len, w_len]
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
+
+            // ---- SCAIL-2 condition fusion -------------------------------------
+            // Reference impl (model_scail2.py:741-777) -- note this is PAIRWISE
+            // addition, not a three-way add, and patch_embedding_mask runs TWICE:
+            //   x          = patch_embedding(cat([ref, video], dim=time))
+            //   x          = x + patch_embedding_mask(ref_masks)
+            //   pose_emb   = patch_embedding_pose(pose) + patch_embedding_mask(driving_masks)
+            //   x          = cat([x, pose_emb], dim=sequence)
+            if (config.is_scail2) {
+                GGML_ASSERT(pose_latents != nullptr && ref_masks != nullptr && driving_masks != nullptr);
+
+                auto patch_embedding_mask = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding_mask"]);
+                auto patch_embedding_pose = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding_pose"]);
+
+                auto ref_mask_emb = patch_embedding_mask->forward(ctx, ref_masks);                                                 // [N*dim, 1+t_len, h_len, w_len]
+                ref_mask_emb      = ggml_reshape_3d(ctx->ggml_ctx, ref_mask_emb,
+                                                    ref_mask_emb->ne[0] * ref_mask_emb->ne[1] * ref_mask_emb->ne[2],
+                                                    ref_mask_emb->ne[3] / N, N);
+                ref_mask_emb      = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, ref_mask_emb, 1, 0, 2, 3));  // [N, (1+t_len)*h_len*w_len, dim]
+                // Fail loudly instead of silently broadcasting: a wrong mask frame
+                // count or resolution is the single most likely integration bug.
+                GGML_ASSERT(ref_mask_emb->ne[1] == x->ne[1] && ref_mask_emb->ne[0] == x->ne[0]);
+                x                 = ggml_add(ctx->ggml_ctx, x, ref_mask_emb);
+
+                auto pose_emb = patch_embedding_pose->forward(ctx, pose_latents);                              // [N*dim, t_len, h_len/2, w_len/2]
+                auto sam_emb  = patch_embedding_mask->forward(ctx, driving_masks);                             // [N*dim, t_len, h_len/2, w_len/2]
+                pose_emb      = ggml_add(ctx->ggml_ctx, pose_emb, sam_emb);
+                pose_emb      = ggml_reshape_3d(ctx->ggml_ctx, pose_emb,
+                                                pose_emb->ne[0] * pose_emb->ne[1] * pose_emb->ne[2],
+                                                pose_emb->ne[3] / N, N);
+                pose_emb      = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, pose_emb, 1, 0, 2, 3));  // [N, pose_len, dim]
+                GGML_ASSERT(pose_emb->ne[0] == x->ne[0]);
+
+                x = ggml_concat(ctx->ggml_ctx, x, pose_emb, 1);  // [N, (1+t_len)*h_len*w_len + pose_len, dim]
+            }
 
             ggml_tensor* audio_local  = nullptr;
             ggml_tensor* audio_global = nullptr;
@@ -837,7 +904,10 @@ namespace WAN {
                              float vace_strength           = 1.f,
                              int64_t N                     = 1,
                              ggml_tensor* audio_embed      = nullptr,
-                             ggml_tensor* reference_latent = nullptr) {
+                             ggml_tensor* reference_latent = nullptr,
+                             ggml_tensor* pose_latents     = nullptr,
+                             ggml_tensor* ref_masks        = nullptr,
+                             ggml_tensor* driving_masks    = nullptr) {
             // Forward pass of DiT.
             // x: [N*C, T, H, W]
             // timestep: [N,]
@@ -865,14 +935,48 @@ namespace WAN {
                 t_len           = ((x->ne[2] + (std::get<0>(config.patch_size) / 2)) / std::get<0>(config.patch_size));
             }
 
-            auto out = forward_orig(ctx, x, timestep, context, pe, clip_fea, vace_context, vace_strength, N, audio_embed, reference_latent);  // [N, (t_len [+t_ref]) *h_len*w_len, pt*ph*pw*C]
+            // SCAIL-2: the reference frame goes on the TIME axis, IN FRONT of the
+            // video (model_scail2.py:741 `x = torch.cat([ref_latents, x], dim=2)`).
+            // This is deliberately different from S2V, which appends the
+            // reference on the SEQUENCE axis inside forward_orig().
+            // The three SCAIL-2 conditioning tensors run through their own Conv3d
+            // with padding 0, so they must already be a multiple of the patch size
+            // -- pad them exactly like the main latent.  (Temporal pad is always 0
+            // because patch_t is 1, so this only ever touches H/W.)
+            if (config.is_scail2) {
+                if (pose_latents != nullptr) {
+                    pose_latents = pad_to_patch_size(ctx, pose_latents);
+                }
+                if (ref_masks != nullptr) {
+                    ref_masks = pad_to_patch_size(ctx, ref_masks);
+                }
+                if (driving_masks != nullptr) {
+                    driving_masks = pad_to_patch_size(ctx, driving_masks);
+                }
+            }
 
-            if (reference_latent != nullptr) {
-                // Exclude reference tokens from the generated video.
+            int64_t ref_t_len = 0;
+            if (config.is_scail2 && reference_latent != nullptr) {
+                auto ref = pad_to_patch_size(ctx, reference_latent);
+                ref_t_len = ((reference_latent->ne[2] + (std::get<0>(config.patch_size) / 2)) / std::get<0>(config.patch_size));
+                x         = ggml_concat(ctx->ggml_ctx, ref, x, 2);  // [N*C, (T_ref+pad) + (T+pad_t), H+pad_h, W+pad_w]
+                t_len += ref_t_len;
+            }
+
+            auto out = forward_orig(ctx, x, timestep, context, pe, clip_fea, vace_context, vace_strength, N, audio_embed, reference_latent,
+                                    pose_latents, ref_masks, driving_masks);  // [N, ((t_len) [+t_ref] [+pose]) *h_len*w_len, pt*ph*pw*C]
+
+            int64_t t_len_video = t_len - ref_t_len;
+            if (config.is_scail2 && reference_latent != nullptr) {
+                // Token order is [ref][video][pose]; keep [video] only.
+                int64_t video_begin = ref_t_len * h_len * w_len;
+                out                 = ggml_ext_slice(ctx->ggml_ctx, out, 1, video_begin, video_begin + t_len_video * h_len * w_len);
+            } else if (reference_latent != nullptr) {
+                // S2V: reference tokens are appended at the END of the sequence.
                 out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, t_len * h_len * w_len);
             }
 
-            out = unpatchify(ctx->ggml_ctx, out, t_len, h_len, w_len);  // [N*C, (T+pad_t) + (T2+pad_t2), H + pad_h, W + pad_w]
+            out = unpatchify(ctx->ggml_ctx, out, t_len_video, h_len, w_len);  // [N*C, (T+pad_t) + (T2+pad_t2), H + pad_h, W + pad_w]
 
             // slice
 
@@ -930,7 +1034,15 @@ namespace WAN {
                     config.text_len  = 512;
                 }
             } else if (config.num_layers == 40) {
-                if (version == VERSION_WAN2_2_S2V) {
+                if (config.is_scail2) {
+                    // SCAIL-2 (14B, Wan2.1-14B-I2V full finetune).
+                    // in_dim = 16 latents + 4 mask channels = 20 (apply_i2v_*_masks in
+                    // the reference impl). mask_dim = 28 = 4 frames packed x 7 binary
+                    // colour channels -- verified against the GGUF, and a wrong value
+                    // will be caught by the Conv3d weight-shape check at load time.
+                    desc          = "SCAIL-2-14B";
+                    config.in_dim = 20;
+                } else if (version == VERSION_WAN2_2_S2V) {
                     desc          = "Wan2.2-S2V-14B";
                     config.in_dim = 16;
                 } else if (config.model_type == "t2v") {
@@ -987,7 +1099,10 @@ namespace WAN {
                                  const sd::Tensor<float>& vace_context_tensor    = {},
                                  float vace_strength                             = 1.f,
                                  const sd::Tensor<float>& audio_embed_tensor     = {},
-                                 const sd::Tensor<float>& ref_latent_tensor      = {}) {
+                                 const sd::Tensor<float>& ref_latent_tensor      = {},
+                                 const sd::Tensor<float>& pose_latents_tensor    = {},
+                                 const sd::Tensor<float>& ref_masks_tensor       = {},
+                                 const sd::Tensor<float>& driving_masks_tensor   = {}) {
             ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE);
 
             ggml_tensor* x               = make_input(x_tensor);
@@ -999,7 +1114,35 @@ namespace WAN {
             ggml_tensor* vace_context    = make_optional_input(vace_context_tensor);
             ggml_tensor* audio_embed     = make_optional_input(audio_embed_tensor);
             ggml_tensor* ref_latent      = make_optional_input(ref_latent_tensor);
+            ggml_tensor* pose_latents    = make_optional_input(pose_latents_tensor);
+            ggml_tensor* ref_masks       = make_optional_input(ref_masks_tensor);
+            ggml_tensor* driving_masks   = make_optional_input(driving_masks_tensor);
 
+            if (config.is_scail2) {
+                // ---- SCAIL-2 three-segment RoPE (model_scail2.py:830-856) ----
+                // Token order is [ref][video][pose].
+                //   ref   : 1 frame,  T shift 0,                    H/W shift 0
+                //   video : T frames, T shift base_video_shift,      H/W shift 0
+                //   pose  : T frames, T shift base_video_shift,      W shift 120,
+                //           then 2x2 average-pooled on the (h, w) plane
+                // base_video_shift = 0 for replace mode, 1 for animation mode.
+                const int T                = static_cast<int>(x->ne[2]);
+                const int H                = static_cast<int>(x->ne[1]);
+                const int W                = static_cast<int>(x->ne[0]);
+                const int pt               = std::get<0>(config.patch_size);
+                const int ph               = std::get<1>(config.patch_size);
+                const int pw               = std::get<2>(config.patch_size);
+                const int base_video_shift = 1;  // animation mode
+
+                auto ref_pe   = Rope::gen_wan_pe_ex(pt, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, 0, 0, 0);
+                auto video_pe = Rope::gen_wan_pe_ex(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 0);
+                auto pose_pe  = Rope::gen_wan_pe_pose_half(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 120);
+
+                pe_vec.clear();
+                pe_vec.insert(pe_vec.end(), ref_pe.begin(), ref_pe.end());
+                pe_vec.insert(pe_vec.end(), video_pe.begin(), video_pe.end());
+                pe_vec.insert(pe_vec.end(), pose_pe.begin(), pose_pe.end());
+            } else {
             pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
                                       static_cast<int>(x->ne[1]),
                                       static_cast<int>(x->ne[0]),
@@ -1009,20 +1152,21 @@ namespace WAN {
                                       1,
                                       config.theta,
                                       config.axes_dim);
-            if (ref_latent != nullptr) {
-                // Match S2V's reference-frame temporal offset.
-                int t_start = std::max(30, static_cast<int>(x->ne[2]) + 9);
-                auto ref_pe = Rope::gen_wan_pe(static_cast<int>(ref_latent->ne[2]),
-                                               static_cast<int>(ref_latent->ne[1]),
-                                               static_cast<int>(ref_latent->ne[0]),
-                                               std::get<0>(config.patch_size),
-                                               std::get<1>(config.patch_size),
-                                               std::get<2>(config.patch_size),
-                                               1,
-                                               config.theta,
-                                               config.axes_dim,
-                                               t_start);
-                pe_vec.insert(pe_vec.end(), ref_pe.begin(), ref_pe.end());
+                if (ref_latent != nullptr) {
+                    // Match S2V's reference-frame temporal offset.
+                    int t_start = std::max(30, static_cast<int>(x->ne[2]) + 9);
+                    auto s2v_ref_pe = Rope::gen_wan_pe(static_cast<int>(ref_latent->ne[2]),
+                                                       static_cast<int>(ref_latent->ne[1]),
+                                                       static_cast<int>(ref_latent->ne[0]),
+                                                       std::get<0>(config.patch_size),
+                                                       std::get<1>(config.patch_size),
+                                                       std::get<2>(config.patch_size),
+                                                       1,
+                                                       config.theta,
+                                                       config.axes_dim,
+                                                       t_start);
+                    pe_vec.insert(pe_vec.end(), s2v_ref_pe.begin(), s2v_ref_pe.end());
+                }
             }
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
             // LOG_VERBOSE("pos_len %d", pos_len);
@@ -1049,7 +1193,10 @@ namespace WAN {
                                            vace_strength,
                                            1,
                                            audio_embed,
-                                           ref_latent);
+                                           ref_latent,
+                                           pose_latents,
+                                           ref_masks,
+                                           driving_masks);
 
             ggml_build_forward_expand(gf, out);
 
@@ -1066,9 +1213,13 @@ namespace WAN {
                                   const sd::Tensor<float>& vace_context    = {},
                                   float vace_strength                      = 1.f,
                                   const sd::Tensor<float>& audio_embed     = {},
-                                  const sd::Tensor<float>& ref_latent      = {}) {
+                                  const sd::Tensor<float>& ref_latent      = {},
+                                  const sd::Tensor<float>& pose_latents    = {},
+                                  const sd::Tensor<float>& ref_masks       = {},
+                                  const sd::Tensor<float>& driving_masks   = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength, audio_embed, ref_latent);
+                return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength, audio_embed, ref_latent,
+                                   pose_latents, ref_masks, driving_masks);
             };
 
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
@@ -1080,7 +1231,10 @@ namespace WAN {
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
             const auto* extra = diffusion_extra_as<WanDiffusionExtra>(diffusion_params);
             static const std::vector<sd::Tensor<float>> no_ref_latents;
-            const auto& ref_latents = config.model_type == "s2v" && diffusion_params.ref_latents != nullptr
+            // S2V appends the reference on the sequence axis; SCAIL-2 prepends it
+            // on the time axis.  Both reach the DiT through ref_latents[0].
+            const bool wants_ref = config.model_type == "s2v" || config.is_scail2;
+            const auto& ref_latents = wants_ref && diffusion_params.ref_latents != nullptr
                                           ? *diffusion_params.ref_latents
                                           : no_ref_latents;
             const sd::Tensor<float> empty_tensor;
@@ -1095,7 +1249,10 @@ namespace WAN {
                            tensor_or_empty(extra->vace_context),
                            extra->vace_strength,
                            tensor_or_empty(extra->audio_embed),
-                           ref_latent);
+                           ref_latent,
+                           tensor_or_empty(extra->pose_latents),
+                           tensor_or_empty(extra->ref_masks),
+                           tensor_or_empty(extra->driving_masks));
         }
 
         void test() {

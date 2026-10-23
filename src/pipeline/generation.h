@@ -12,6 +12,20 @@ static inline bool sd_version_supports_animatediff(SDVersion version) {
 
 namespace sd::pipeline {
 
+    // SCAIL-2 character-animation conditioning (three extra DiT inputs).
+    // All three are empty unless the diffusion model is SCAIL-2.
+    // H/W below are LATENT dims; 28 = 4 frames packed x 7 binary colour channels.
+    struct SCAIL2Conditioning {
+        // [20, F, H/2, W/2] -- driving video VAE-encoded at half spatial res + 4 "ones" ch
+        sd::Tensor<float> pose_latents;
+        // [28, 1 + F, H, W]
+        sd::Tensor<float> ref_masks;
+        // [28, F, H/2, W/2]
+        sd::Tensor<float> driving_masks;
+
+        bool empty() const { return pose_latents.empty(); }
+    };
+
     struct ImageGenerationLatents {
         sd::Tensor<float> init_latent;
         sd::Tensor<float> concat_latent;
@@ -29,6 +43,7 @@ namespace sd::pipeline {
         sd::Tensor<float> clip_vision_output;
         sd::Tensor<float> vace_context;
         sd::Tensor<float> s2v_audio_embed;
+        SCAIL2Conditioning scail2;
         int64_t ref_image_num                  = 0;
         int64_t video_conditioning_frame_count = 0;
         int64_t video_target_frame_count       = 0;

@@ -21,6 +21,7 @@
 #include "model/adapter/lora.hpp"
 #include "model_builders.h"
 #include "model_manager.h"
+#include "pipeline/generation.h"  // SCAIL2Conditioning (only forward-declares StableDiffusionGGML, no cycle)
 #include "stable-diffusion.h"
 
 class RNG;
@@ -460,7 +461,8 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              bool preview_final_step,
-                             const sd::Tensor<float>& video_positions = {});
+                             const sd::Tensor<float>& video_positions = {},
+                             const sd::pipeline::SCAIL2Conditioning& scail2 = {});
 
     int get_vae_scale_factor();
 

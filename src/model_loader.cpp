@@ -463,6 +463,7 @@ SDVersion ModelLoader::get_sd_version() const {
     bool is_wan                      = false;
     bool is_s2v                      = false;
     int64_t patch_embedding_channels = 0;
+    bool has_scail2                  = false;
     bool has_img_emb                 = false;
     bool has_middle_block_1          = false;
     bool has_output_block_311        = false;
@@ -589,6 +590,14 @@ SDVersion ModelLoader::get_sd_version() const {
         if (tensor_storage.name.find("model.diffusion_model.patch_embedding.weight") != std::string::npos) {
             patch_embedding_channels = tensor_storage.ne[3];
         }
+        // SCAIL-2 carries two extra parallel patch embeddings that no other Wan
+        // variant has: a 28-channel mask branch and a 20-channel pose branch.
+        // Its main patch_embedding is 20ch (ne[3] == 102400), which matches
+        // neither the I2V (184320) nor the TI2V (147456) constant, so without
+        // this check it silently falls through to plain VERSION_WAN2 (text-only).
+        if (tensor_storage.name.find("model.diffusion_model.patch_embedding_mask.weight") != std::string::npos) {
+            has_scail2 = true;
+        }
         if (tensor_storage.name.find("model.diffusion_model.img_emb") != std::string::npos) {
             has_img_emb = true;
         }
@@ -648,6 +657,9 @@ SDVersion ModelLoader::get_sd_version() const {
         LOG_DEBUG("patch_embedding_channels %d", patch_embedding_channels);
         if (is_s2v) {
             return VERSION_WAN2_2_S2V;
+        }
+        if (has_scail2) {
+            return VERSION_WAN2_SCAIL2;
         }
         if (patch_embedding_channels == 184320 && !has_img_emb) {
             return VERSION_WAN2_2_I2V;
