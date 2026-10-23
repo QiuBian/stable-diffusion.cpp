@@ -25,7 +25,19 @@
 name: Win-CUDA12 only
 
 on:
+  # 手动触发（网页 Actions → Run workflow）。
+  # ⚠️ fork 仓库经 REST API 调 /dispatches 会返回 422
+  #    "Actions has been disabled for this repository"，
+  #    但 repository_dispatch / rerun 都正常（204/201），
+  #    说明不是 Actions 被关，是 fork 上这个端点的怪癖。
+  #    → 网页按钮仍可用；脚本/API 触发一律走下面的 push。
   workflow_dispatch:
+  # 脚本触发通道：往开发分支 push 就自动编译。
+  # 只挂 omnistudio/* 开发分支，不挂 master，
+  # 避免以后同步上游时误触发。
+  push:
+    branches:
+      - omnistudio/scail-animate
 
 jobs:
   windows-cuda12:
