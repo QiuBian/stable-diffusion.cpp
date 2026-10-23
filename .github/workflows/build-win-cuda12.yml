@@ -69,15 +69,29 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          $filePath = ".\build\bin\Release\*"
-          if (Test-Path $filePath) {
-            Copy-Item ggml/LICENSE .\build\bin\Release\ggml.txt
-            Copy-Item LICENSE .\build\bin\Release\stable-diffusion.cpp.txt
-          } else {
-            ls .\build\bin
+          # 🔴 Ninja 是「单配置」生成器 -> 产物直接落在 .\build\bin\，**没有 Release 子目录**；
+          #    只有 VS 多配置生成器（-G "Visual Studio ..."）才会多一层 Release。
+          #    踩过两次：写死 .\build\bin\Release\* -> Test-Path 失败 -> 编译全绿但整个 run 红。
+          #    两种布局都兼容，别再写死。
+          $bin = ".\build\bin"
+          if (Test-Path ".\build\bin\Release\stable-diffusion.dll") {
+            $bin = ".\build\bin\Release"
+          }
+          if (-not (Test-Path "$bin\stable-diffusion.dll")) {
+            Write-Host "stable-diffusion.dll not found under $bin ; dumping every dll in build\ :"
+            Get-ChildItem .\build -Recurse -Filter *.dll |
+              Select-Object -ExpandProperty FullName
             throw "Can't find stable-diffusion.dll"
           }
-          7z a sd-win-cuda12-x64.zip $filePath
+          Copy-Item ggml/LICENSE "$bin\ggml.txt" -Force
+          Copy-Item LICENSE "$bin\stable-diffusion.cpp.txt" -Force
+          Write-Host "packing from $bin"
+          # 用 Push-Location 再打包，压缩包内是**扁平**结构（不带 build\bin\ 前缀）。
+          # -xr!cudart 是保险：万一以后调整了步骤顺序，别把 787MB 的 cudart 混进主包。
+          Push-Location $bin
+          7z a "$env:GITHUB_WORKSPACE\sd-win-cuda12-x64.zip" * -xr!cudart
+          Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw "7z 打包主包失败: $LASTEXITCODE" }
 
       - name: Pack Cuda runtime
         run: |
@@ -85,7 +99,10 @@ jobs:
           robocopy "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           # robocopy 退出码 0-7 都算成功（1 = 有文件被复制），>=8 才是失败
           if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
-          7z a sd-cudart-win-cu12-x64.zip $dst\*
+          Push-Location $dst
+          7z a "$env:GITHUB_WORKSPACE\sd-cudart-win-cu12-x64.zip" *
+          Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw "7z 打包 cudart 失败: $LASTEXITCODE" }
 
       - name: Upload
         uses: actions/upload-artifact@v4
