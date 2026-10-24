@@ -22,6 +22,13 @@ namespace sd::pipeline {
         sd::Tensor<float> ref_masks;
         // [28, F, H/2, W/2]
         sd::Tensor<float> driving_masks;
+        // false => animation mode, true => replacement mode.
+        // Consumed by the DiT's RoPE construction (see wan.hpp):
+        //   base_video_shift    = replace_flag ? 0 : 1   (video + pose T shift)
+        //   rope_H_shift["ref"] = replace_flag ? 120 : 0 (reference segment)
+        // It is part of the conditioning, not a UI hint: flipping it changes the
+        // output even with identical masks.
+        bool replace_flag = false;
 
         bool empty() const { return pose_latents.empty(); }
     };

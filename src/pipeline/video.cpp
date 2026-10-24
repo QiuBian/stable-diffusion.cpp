@@ -1344,6 +1344,16 @@ namespace sd::pipeline {
             const int latent_h = request->height / request->vae_scale_factor;
             const int t_lat    = (int)sd->video_frames_to_latent_frames(request->frames);
 
+            // 🔴 The mode switch is part of the CONDITIONING, not a UI hint:
+            // upstream (`wan/modules/model_scail2.py:836-848`) derives the RoPE
+            // offsets from it, so it has to reach the DiT.  It used to be absent
+            // entirely and wan.hpp hard-coded the animation value, which made
+            // replacement mode silently emit a near-constant white plane.
+            latents.scail2.replace_flag = sd_vid_gen_params->scail_replace_flag;
+            LOG_INFO("SCAIL-2 mode: %s (frames=%d, t_lat=%d)",
+                     latents.scail2.replace_flag ? "replacement" : "animation",
+                     request->frames, t_lat);
+
             if (sd_vid_gen_params->scail_ref_masks_size > 0) {
                 std::vector<sd::Tensor<float>> mask_frames;
                 mask_frames.reserve(sd_vid_gen_params->scail_ref_masks_size);

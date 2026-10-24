@@ -117,6 +117,9 @@ struct WanDiffusionExtra {
     const sd::Tensor<float>* pose_latents   = nullptr;
     const sd::Tensor<float>* ref_masks      = nullptr;
     const sd::Tensor<float>* driving_masks  = nullptr;
+    // SCAIL-2 animation (false) vs replacement (true).  Drives the RoPE offsets
+    // built inside Wan::compute -- see wan.hpp's three-segment RoPE block.
+    bool replace_flag = false;
 };
 
 struct HiDreamO1DiffusionExtra {

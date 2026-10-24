@@ -1102,7 +1102,8 @@ namespace WAN {
                                  const sd::Tensor<float>& ref_latent_tensor      = {},
                                  const sd::Tensor<float>& pose_latents_tensor    = {},
                                  const sd::Tensor<float>& ref_masks_tensor       = {},
-                                 const sd::Tensor<float>& driving_masks_tensor   = {}) {
+                                 const sd::Tensor<float>& driving_masks_tensor   = {},
+                                 bool replace_flag                               = false) {
             ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE);
 
             ggml_tensor* x               = make_input(x_tensor);
@@ -1121,18 +1122,30 @@ namespace WAN {
             if (config.is_scail2) {
                 // ---- SCAIL-2 three-segment RoPE (model_scail2.py:830-856) ----
                 // Token order is [ref][video][pose].
-                //   ref   : 1 frame,  T shift 0,                    H/W shift 0
-                //   video : T frames, T shift base_video_shift,      H/W shift 0
-                //   pose  : T frames, T shift base_video_shift,      W shift 120,
+                //   ref   : T shift 0,          H shift (replace ? 120 : 0), W shift 0
+                //   video : T shift base_shift, H shift 0,                  W shift 0
+                //   pose  : T shift base_shift, H shift 0,                  W shift 120,
                 //           then 2x2 average-pooled on the (h, w) plane
-                // base_video_shift = 0 for replace mode, 1 for animation mode.
+                //
+                // Mirrors wan/modules/model_scail2.py:836-848 with
+                // additional_ref_count == 0 (we ship no extra reference images):
+                //
+                //   base_video_shift = 0 if replace_flag else 1
+                //   rope_T_shift = {ref: 0, pose: base_video_shift, video: base_video_shift}
+                //   rope_H_shift = {ref: 120 if replace_flag else 0, pose: 0, video: 0}
+                //   rope_W_shift = {ref: 0, pose: 120, video: 0}
+                //
+                // Getting this wrong does NOT raise: the model happily attends to
+                // the wrong positions and returns mush.  See scail_utils.py:117-121
+                // for the mask background colours that go with each mode.
                 const int T                = static_cast<int>(x->ne[2]);
                 const int H                = static_cast<int>(x->ne[1]);
                 const int W                = static_cast<int>(x->ne[0]);
                 const int pt               = std::get<0>(config.patch_size);
                 const int ph               = std::get<1>(config.patch_size);
                 const int pw               = std::get<2>(config.patch_size);
-                const int base_video_shift = 1;  // animation mode
+                const int base_video_shift = replace_flag ? 0 : 1;
+                const int ref_h_shift      = replace_flag ? 120 : 0;
 
                 // The reference latent is prepended on the time axis inside
                 // Wan::forward() -- so the RoPE reference segment has to be
@@ -1149,10 +1162,15 @@ namespace WAN {
 
                 std::vector<float> ref_pe;
                 if (ref_frames > 0) {
-                    ref_pe = Rope::gen_wan_pe_ex(ref_frames, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, 0, 0, 0);
+                    ref_pe = Rope::gen_wan_pe_ex(ref_frames, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, 0, ref_h_shift, 0);
                 }
                 auto video_pe = Rope::gen_wan_pe_ex(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 0);
                 auto pose_pe  = Rope::gen_wan_pe_pose_half(T, H, W, pt, ph, pw, 1, config.theta, config.axes_dim, base_video_shift, 0, 120);
+
+                LOG_DEBUG("SCAIL-2 RoPE mode=%s ref_frames=%d T=%d H=%d W=%d "
+                          "(base_video_shift=%d ref_h_shift=%d)",
+                          replace_flag ? "replacement" : "animation",
+                          ref_frames, T, H, W, base_video_shift, ref_h_shift);
 
                 pe_vec.clear();
                 pe_vec.insert(pe_vec.end(), ref_pe.begin(), ref_pe.end());
@@ -1247,10 +1265,11 @@ namespace WAN {
                                   const sd::Tensor<float>& ref_latent      = {},
                                   const sd::Tensor<float>& pose_latents    = {},
                                   const sd::Tensor<float>& ref_masks       = {},
-                                  const sd::Tensor<float>& driving_masks   = {}) {
+                                  const sd::Tensor<float>& driving_masks   = {},
+                                  bool replace_flag                        = false) {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength, audio_embed, ref_latent,
-                                   pose_latents, ref_masks, driving_masks);
+                                   pose_latents, ref_masks, driving_masks, replace_flag);
             };
 
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
@@ -1283,7 +1302,8 @@ namespace WAN {
                            ref_latent,
                            tensor_or_empty(extra->pose_latents),
                            tensor_or_empty(extra->ref_masks),
-                           tensor_or_empty(extra->driving_masks));
+                           tensor_or_empty(extra->driving_masks),
+                           extra->replace_flag);
         }
 
         void test() {

@@ -2685,7 +2685,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                                            condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios[0],
                                                            scail2.pose_latents.empty() ? nullptr : &scail2.pose_latents,
                                                            scail2.ref_masks.empty() ? nullptr : &scail2.ref_masks,
-                                                           scail2.driving_masks.empty() ? nullptr : &scail2.driving_masks};
+                                                           scail2.driving_masks.empty() ? nullptr : &scail2.driving_masks,
+                                                           scail2.replace_flag};
             } else if (sd_version_is_hunyuan_video(version)) {
                 diffusion_params.extra = HunyuanVideoDiffusionExtra{
                     &guidance_tensor,

@@ -305,6 +305,9 @@ struct SDGenerationParams {
     // SCAIL-2 correspondence masks: 7-colour coded RGB frames (no VAE involved).
     std::vector<SDImageOwner> scail_ref_masks;
     std::vector<SDImageOwner> scail_driving_masks;
+    // SCAIL-2 mode: false = animation, true = replacement.  Changes the RoPE
+    // offsets inside the DiT, not just the mask background colours.
+    bool scail_replace_flag = false;
 
     // Backing storage for sd_img_gen_params_t view fields.
     std::vector<sd_image_t> ref_image_views;

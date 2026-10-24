@@ -2336,6 +2336,20 @@ bool SDGenerationParams::from_json_str(
         LOG_ERROR("invalid input image array");
         return false;
     }
+    // SCAIL-2 mode switch.  Absent => animation mode (upstream default:
+    // `generate.py` only sets it when --replace_flag is passed).
+    if (j.contains("scail_replace_flag")) {
+        const auto& v = j.at("scail_replace_flag");
+        if (v.is_boolean()) {
+            scail_replace_flag = v.get<bool>();
+        } else if (v.is_number()) {
+            // tolerate 0/1 from loosely typed clients
+            scail_replace_flag = v.get<double>() != 0.0;
+        } else {
+            LOG_ERROR("scail_replace_flag must be a boolean");
+            return false;
+        }
+    }
 
     return true;
 }
@@ -2911,6 +2925,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.scail_ref_masks_size      = static_cast<int>(scail_ref_mask_views.size());
     params.scail_driving_masks       = scail_driving_mask_views.empty() ? nullptr : scail_driving_mask_views.data();
     params.scail_driving_masks_size  = static_cast<int>(scail_driving_mask_views.size());
+    params.scail_replace_flag        = scail_replace_flag;
     params.width                     = get_resolved_width();
     params.height                    = get_resolved_height();
     params.sample_params             = sample_params;

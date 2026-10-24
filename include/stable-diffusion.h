@@ -449,6 +449,18 @@ typedef struct {
     int scail_ref_masks_size;
     sd_image_t* scail_driving_masks;
     int scail_driving_masks_size;
+    // SCAIL-2 mode switch.  false => animation mode (the reference character is
+    // animated, the scene comes from the reference image), true => replacement
+    // mode (the reference character REPLACES the person in the driving video and
+    // the video's background is kept).
+    //
+    // Upstream (`wan/modules/model_scail2.py:836-848`) uses it for the RoPE
+    // offsets, so it is NOT a cosmetic flag:
+    //   base_video_shift         = 0 if replace_flag else 1   (video + pose T shift)
+    //   rope_H_shift["ref"]      = 120 if replace_flag else 0 (reference segment)
+    // Leaving it hard-coded to animation made replacement mode silently produce
+    // a near-constant white/grey plane.
+    bool scail_replace_flag;
     int width;
     int height;
     sd_sample_params_t sample_params;
